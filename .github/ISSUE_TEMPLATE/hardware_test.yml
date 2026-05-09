@@ -1,0 +1,34 @@
+name: Hardware test report
+description: Record compatibility notes from real hardware
+title: "[Hardware]: "
+labels: ["hardware"]
+body:
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: List the exact hardware and firmware versions.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: PWM arm and disarm works
+        - label: Failsafe works
+        - label: O4 handshake works
+        - label: DisplayPort OSD works
+        - label: Battery display works
+        - label: GPS works
+        - label: Barometer works
+        - label: IMU works
+        - label: Compass works
+        - label: Sensor reconnect works
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: What passed, what failed, and what should be tested again?
+    validations:
+      required: true
