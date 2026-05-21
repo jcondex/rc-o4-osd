@@ -48,10 +48,13 @@ Pin map:
 | GP1 | UART0 RX from DJI O4 TX |
 | GP4 | UART1 TX to GPS RX |
 | GP5 | UART1 RX from GPS TX |
-| GP6 | I2C1 SDA |
-| GP7 | I2C1 SCL |
-| GP15 | RC PWM input |
-| GP22 | Compass calibration trigger |
+| GP6 | I2C1 SDA for BMP390 and MPU-6050 |
+| GP7 | I2C1 SCL for BMP390 and MPU-6050 |
+| GP8 | I2C0 SDA for M100 compass |
+| GP9 | I2C0 SCL for M100 compass |
+| GP13 | RC PWM input |
+| GP16 | Compass calibration trigger |
+| GP20 | Reserved OSD/config button |
 | GP25 | Onboard LED |
 | GP26 | Battery ADC input |
 
@@ -109,8 +112,7 @@ Main settings are in [src/config.h](src/config.h).
 Common settings to check before powering hardware:
 
 * Battery divider values
-* Battery cell count
-* Low battery warning voltage
+* Battery voltage calibration
 * Magnetic declination
 * GPS proactive MSP_RAW_GPS setting
 * I2C sensor addresses
@@ -125,7 +127,7 @@ PWM signal loss forces failsafe and reports disarmed over MSP. After failsafe, t
 
 Pico GPIO is 3.3 V only. Use a divider or level shifter if the receiver PWM output is 5 V.
 
-Keep the DJI O4 Air Unit cooled during bench testing.
+Keep the DJI O4 Air Unit cooled during bench testing. Use a 3.7 V to 13.2 V supply capable of at least 10 W.
 
 ## Documentation
 

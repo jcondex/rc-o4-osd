@@ -43,11 +43,16 @@ add_executable(rc-o4-osd
         src/compass_qmc5883l.cpp
         src/displayport.cpp
         src/gps.cpp
+        src/gps_uart.cpp
         src/imu_mpu6050.cpp
         src/msp.cpp
+        src/msp_osd_config.cpp
         src/nav.cpp
+        src/pwm_self_test.cpp
         src/rc_pwm_pio.cpp
+        src/sensor_manager.cpp
         src/state_machine.cpp
+        src/telemetry_debug.cpp
 )
 
 pico_set_program_name(rc-o4-osd "rc-o4-osd")
@@ -75,6 +80,7 @@ target_link_libraries(rc-o4-osd
         hardware_flash
         hardware_i2c
         hardware_pio
+        hardware_pwm
         hardware_sync
         hardware_uart
         hardware_watchdog

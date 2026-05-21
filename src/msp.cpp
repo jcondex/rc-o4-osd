@@ -3,13 +3,19 @@
 #include <math.h>
 #include <string.h>
 #include "config.h"
+#include "msp_osd_config.h"
 
 namespace msp {
 namespace {
 
 constexpr uint8_t kProtocolVersion = 0;
 constexpr uint8_t kApiMajor = 1;
-constexpr uint8_t kApiMinor = 42;
+constexpr uint8_t kApiMinor = 45;
+constexpr uint8_t kFcMajor = 4;
+constexpr uint8_t kFcMinor = 4;
+constexpr uint8_t kFcPatch = 3;
+constexpr uint8_t kDjiFlagArm = 0;
+constexpr uint8_t kDjiFlagFailsafe = 4;
 
 static void put_u8(uint8_t *out, size_t &n, uint8_t v) { out[n++] = v; }
 static void put_u16(uint8_t *out, size_t &n, uint16_t v) { out[n++] = uint8_t(v); out[n++] = uint8_t(v >> 8); }
@@ -28,6 +34,17 @@ static uint8_t vbat_deci(const TelemetryState &state) {
 static uint8_t gps_fix_type(const GpsState &gps) {
     if (!gps.fix_valid) return 0;
     return gps.fix_type == 0 ? 1 : gps.fix_type;
+}
+
+static uint32_t flight_mode_flags(const TelemetryState &state) {
+    uint32_t flags = 0;
+    if (state.armed) {
+        flags |= (1u << kDjiFlagArm);
+    }
+    if (state.app_state == AppState::Failsafe || state.rc.failsafe) {
+        flags |= (1u << kDjiFlagFailsafe);
+    }
+    return flags;
 }
 
 static void build_raw_gps_payload(const TelemetryState &state, uint8_t *out, size_t &n) {
@@ -62,7 +79,7 @@ static void build_raw_gps_payload(const TelemetryState &state, uint8_t *out, siz
 
 static bool is_empty_ack(uint8_t cmd) {
     switch (cmd) {
-    case MSP_OSD_CONFIG:
+    case MSP_SET_OSD_CANVAS:
     case MSP_FILTER_CONFIG:
     case MSP_PID_ADVANCED:
     case MSP_RC:
@@ -101,6 +118,9 @@ void send_packet(Endpoint endpoint, uint8_t cmd, const uint8_t *payload, size_t 
     }
     frame[5 + len] = checksum;
     endpoint.writer(frame, len + 6, endpoint.ctx);
+    if (endpoint.stats) {
+        ++endpoint.stats->tx_packets;
+    }
 }
 
 void send_empty(Endpoint endpoint, uint8_t cmd) {
@@ -108,6 +128,9 @@ void send_empty(Endpoint endpoint, uint8_t cmd) {
 }
 
 void send_displayport(Endpoint endpoint, const uint8_t *payload, size_t len) {
+    if (endpoint.stats) {
+        ++endpoint.stats->displayport_packets;
+    }
     send_packet(endpoint, MSP_DISPLAYPORT, payload, len);
 }
 
@@ -132,9 +155,9 @@ bool build_response(uint8_t cmd, const TelemetryState &state, uint8_t *out, size
         put_data(out, n, "BTFL", 4);
         break;
     case MSP_FC_VERSION:
-        put_u8(out, n, 4);
-        put_u8(out, n, 0);
-        put_u8(out, n, 0);
+        put_u8(out, n, kFcMajor);
+        put_u8(out, n, kFcMinor);
+        put_u8(out, n, kFcPatch);
         break;
     case MSP_BOARD_INFO:
         put_data(out, n, "PICO", 4);
@@ -156,14 +179,14 @@ bool build_response(uint8_t cmd, const TelemetryState &state, uint8_t *out, size
         put_u16(out, n, state.cycle_time_us);
         put_u16(out, n, state.i2c_errors);
         put_u16(out, n, active_sensor_mask(state));
-        put_u32(out, n, state.armed ? 1u : 0u);
+        put_u32(out, n, flight_mode_flags(state));
         put_u8(out, n, 0);
         break;
     case MSP_STATUS_EX:
         put_u16(out, n, state.cycle_time_us);
         put_u16(out, n, state.i2c_errors);
         put_u16(out, n, active_sensor_mask(state));
-        put_u32(out, n, state.armed ? 1u : 0u);
+        put_u32(out, n, flight_mode_flags(state));
         put_u8(out, n, 0);
         put_u16(out, n, 10);
         put_u16(out, n, 0);
@@ -205,6 +228,13 @@ bool build_response(uint8_t cmd, const TelemetryState &state, uint8_t *out, size
         put_u16(out, n, 0);
         put_i16(out, n, 0);
         put_u8(out, n, 0);
+        break;
+    case MSP_OSD_CONFIG:
+        build_osd_config_payload(out, n);
+        break;
+    case MSP_OSD_CANVAS:
+        put_u8(out, n, OSD_CANVAS_COLS);
+        put_u8(out, n, OSD_CANVAS_ROWS);
         break;
     default:
         if (is_empty_ack(cmd)) {
@@ -280,11 +310,32 @@ void Parser::parse_byte(uint8_t b, const TelemetryState &telemetry, Endpoint end
         break;
     case RxState::ReadChecksum:
         if (b == checksum_ && direction_ == '<') {
-            uint8_t response[128] = {};
+            ++stats_.rx_packets;
+            stats_.last_cmd = cmd_;
+            if (cmd_ == MSP_NAME) {
+                ++stats_.name_requests;
+            } else if (cmd_ == MSP_OSD_CONFIG) {
+                ++stats_.osd_config_requests;
+            } else if (cmd_ == MSP_OSD_CANVAS) {
+                ++stats_.osd_canvas_requests;
+            } else if (cmd_ == MSP_SET_OSD_CANVAS) {
+                ++stats_.set_osd_canvas_requests;
+                if (len_ >= 2) {
+                    stats_.last_canvas_cols = payload_[0];
+                    stats_.last_canvas_rows = payload_[1];
+                }
+            }
+            uint8_t response[256] = {};
             size_t response_len = 0;
             if (build_response(cmd_, telemetry, response, sizeof(response), &response_len)) {
                 send_packet(endpoint, cmd_, response, response_len);
+            } else {
+                ++stats_.unknown_commands;
             }
+        } else if (direction_ == '<') {
+            ++stats_.checksum_errors;
+            stats_.last_bad_cmd = cmd_;
+            stats_.last_bad_len = len_;
         }
         reset();
         break;

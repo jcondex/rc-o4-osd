@@ -11,6 +11,13 @@ enum class AppState : uint8_t {
     Failsafe,
 };
 
+enum class RcSwitchPosition : uint8_t {
+    Unknown,
+    Low,
+    Middle,
+    High,
+};
+
 struct BatteryState {
     uint16_t raw_adc = 0;
     float volts = 0.0f;
@@ -20,6 +27,12 @@ struct BatteryState {
 struct BaroState {
     bool initialized = false;
     bool valid = false;
+    uint8_t chip_id = 0;
+    uint8_t i2c_addr = 0;
+    uint8_t err_reg = 0;
+    uint8_t status_reg = 0;
+    uint32_t raw_pressure = 0;
+    uint32_t raw_temperature = 0;
     float pressure_pa = 101325.0f;
     float temperature_c = 0.0f;
     float altitude_m = 0.0f;
@@ -60,6 +73,7 @@ struct CompassState {
 };
 
 struct GpsState {
+    bool receiving = false;
     bool fix_valid = false;
     uint8_t fix_type = 0;
     uint8_t satellites = 0;
@@ -70,6 +84,7 @@ struct GpsState {
     float course_deg = 0.0f;
     float hdop = 99.9f;
     bool updated = false;
+    uint32_t last_message_ms = 0;
     uint32_t last_fix_ms = 0;
 };
 
@@ -77,10 +92,21 @@ struct RcState {
     bool signal_valid = false;
     bool failsafe = true;
     bool arm_switch_high = false;
+    bool arm_switch_middle = false;
     bool arm_switch_low = false;
-    bool rearm_latched = true;
+    bool cockpit_mode_requested = false;
+    bool rearm_latched = false;
+    bool has_armed_once = false;
+    bool pwm_pin_level = false;
+    RcSwitchPosition switch_position = RcSwitchPosition::Unknown;
     uint16_t pulse_us = 0;
+    uint16_t last_raw_pulse_us = 0;
+    uint16_t sw_pulse_us = 0;
     uint32_t last_valid_ms = 0;
+    uint32_t pio_pulses = 0;
+    uint32_t pio_rejected = 0;
+    uint32_t sw_edges = 0;
+    uint32_t irq_pulses = 0;
 };
 
 struct NavState {
@@ -95,6 +121,12 @@ struct NavState {
     float trip_distance_m = 0.0f;
     float max_speed_kmh = 0.0f;
     uint32_t armed_since_ms = 0;
+};
+
+struct SensorFailureCounters {
+    uint32_t imu = 0;
+    uint32_t baro = 0;
+    uint32_t compass = 0;
 };
 
 struct TelemetryState {
@@ -114,4 +146,5 @@ struct TelemetryState {
     GpsState gps;
     RcState rc;
     NavState nav;
+    SensorFailureCounters sensor_failures;
 };

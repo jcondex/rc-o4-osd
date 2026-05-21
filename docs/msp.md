@@ -6,13 +6,13 @@ The firmware reports a Betaflight compatible identity:
 
 | Command | Response |
 | --- | --- |
-| MSP_API_VERSION | 1.42 |
+| MSP_API_VERSION | 1.45 |
 | MSP_FC_VARIANT | BTFL |
-| MSP_FC_VERSION | 4.0.0 |
+| MSP_FC_VERSION | 4.4.3 |
 | MSP_BOARD_INFO | PICO |
 | MSP_NAME | RC-O4-OSD |
 
-API 1.42 is used for DJI O4 compatibility.
+API 1.45 and Betaflight 4.4.3 identity are used so DJI O4 treats the device as a Betaflight 4.4+ MSP+DisplayPort endpoint.
 
 ## DisplayPort
 

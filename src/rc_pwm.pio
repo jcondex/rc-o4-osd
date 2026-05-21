@@ -1,5 +1,6 @@
 .program rc_pwm
-; Measure high pulse width. State machine clock is configured to 1 MHz.
+; Measure high pulse width. The count loop takes two state-machine cycles,
+; so the state machine runs at 2 MHz to report elapsed microseconds.
 ; The pushed value is elapsed microseconds for the high pulse.
 
     wait 0 pin 0
@@ -20,10 +21,15 @@ still_high:
 % c-sdk {
 static inline void rc_pwm_program_init(PIO pio, uint sm, uint offset, uint pin) {
     pio_gpio_init(pio, pin);
+#if PWM_DEBUG_INPUT_PULLUP
+    gpio_pull_up(pin);
+#else
+    gpio_pull_down(pin);
+#endif
     pio_sm_config c = rc_pwm_program_get_default_config(offset);
     sm_config_set_in_pins(&c, pin);
     sm_config_set_jmp_pin(&c, pin);
-    sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / 1000000.0f);
+    sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / 2000000.0f);
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
     pio_sm_init(pio, sm, offset, &c);
 }

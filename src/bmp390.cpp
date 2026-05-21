@@ -17,28 +17,49 @@ float g_zero_altitude_m = 0.0f;
 double g_reference_pressure_pa = 101325.0;
 float g_prev_filtered_m = 0.0f;
 bool g_filter_seeded = false;
+float g_seed_pressure_min_pa = 0.0f;
+float g_seed_pressure_max_pa = 0.0f;
+uint8_t g_seed_sample_count = 0;
 
 constexpr uint8_t REG_CHIP_ID = 0x00;
+constexpr uint8_t REG_ERR = 0x02;
+constexpr uint8_t REG_STATUS = 0x03;
 constexpr uint8_t REG_DATA = 0x04;
 constexpr uint8_t REG_CALIB = 0x31;
 constexpr uint8_t REG_PWR_CTRL = 0x1B;
 constexpr uint8_t REG_OSR = 0x1C;
 constexpr uint8_t REG_ODR = 0x1D;
 constexpr uint8_t REG_CONFIG = 0x1F;
+constexpr uint8_t BMP390_PWR_SLEEP = 0x00;
+constexpr uint8_t BMP390_PWR_PRESS_TEMP_NORMAL = 0x33;
+constexpr uint8_t BMP390_OSR_PRESS_X8_TEMP_X1 = 0x03;
+constexpr uint8_t BMP390_ODR_25HZ = 0x03;
+constexpr uint8_t BMP390_IIR_COEFF_3 = 0x02;
+constexpr uint8_t BASELINE_STABLE_SAMPLES = 5;
+constexpr float BASELINE_MAX_SPAN_PA = 150.0f;
 
 #ifndef RC_O4_OSD_HOST_TEST
 static bool probe(uint8_t addr) {
     uint8_t id = 0;
-    return i2c_read_regs(I2C_PORT, addr, REG_CHIP_ID, &id, 1) && (id == 0x60 || id == 0x50);
+    return i2c_read_regs(SENSOR_I2C_PORT, addr, REG_CHIP_ID, &id, 1) && (id == 0x60 || id == 0x50);
 }
 
 static bool read_calibration(uint8_t addr) {
     uint8_t raw[21] = {};
-    if (!i2c_read_regs(I2C_PORT, addr, REG_CALIB, raw, sizeof(raw))) return false;
+    if (!i2c_read_regs(SENSOR_I2C_PORT, addr, REG_CALIB, raw, sizeof(raw))) return false;
     parse_calibration(raw, g_calib);
     return true;
 }
 #endif
+
+static void reset_baseline_filter(BaroState &state) {
+    g_filter_seeded = false;
+    g_seed_sample_count = 0;
+    g_seed_pressure_min_pa = 0.0f;
+    g_seed_pressure_max_pa = 0.0f;
+    state.relative_altitude_m = 0.0f;
+    state.vertical_speed_ms = 0.0f;
+}
 }
 
 void parse_calibration(const uint8_t raw[21], Calibration &cal) {
@@ -101,6 +122,36 @@ float pressure_to_altitude(double pressure_pa, double reference_pa) {
     return 44330.0f * (1.0f - powf(float(pressure_pa / reference_pa), 1.0f / 5.255f));
 }
 
+bool baseline_seed_ready(float pressure_pa) {
+    if (pressure_pa <= 10000.0f) {
+        g_seed_sample_count = 0;
+        return false;
+    }
+
+    if (g_seed_sample_count == 0) {
+        g_seed_pressure_min_pa = pressure_pa;
+        g_seed_pressure_max_pa = pressure_pa;
+        g_seed_sample_count = 1;
+        return false;
+    }
+
+    const float next_min = fminf(g_seed_pressure_min_pa, pressure_pa);
+    const float next_max = fmaxf(g_seed_pressure_max_pa, pressure_pa);
+    if ((next_max - next_min) > BASELINE_MAX_SPAN_PA) {
+        g_seed_pressure_min_pa = pressure_pa;
+        g_seed_pressure_max_pa = pressure_pa;
+        g_seed_sample_count = 1;
+        return false;
+    }
+
+    g_seed_pressure_min_pa = next_min;
+    g_seed_pressure_max_pa = next_max;
+    if (g_seed_sample_count < BASELINE_STABLE_SAMPLES) {
+        ++g_seed_sample_count;
+    }
+    return g_seed_sample_count >= BASELINE_STABLE_SAMPLES;
+}
+
 bool init(BaroState &state) {
 #ifdef RC_O4_OSD_HOST_TEST
     (void)state;
@@ -117,11 +168,17 @@ bool init(BaroState &state) {
     }
 
     bool ok = true;
-    ok &= i2c_write_reg_u8(I2C_PORT, g_addr, REG_PWR_CTRL, 0x33);
-    ok &= i2c_write_reg_u8(I2C_PORT, g_addr, REG_OSR, 0x03);
-    ok &= i2c_write_reg_u8(I2C_PORT, g_addr, REG_ODR, 0x04);
-    ok &= i2c_write_reg_u8(I2C_PORT, g_addr, REG_CONFIG, 0x02);
+    uint8_t id = 0;
+    ok &= i2c_read_regs(SENSOR_I2C_PORT, g_addr, REG_CHIP_ID, &id, 1);
+    state.chip_id = id;
+    state.i2c_addr = g_addr;
+    ok &= i2c_write_reg_u8(SENSOR_I2C_PORT, g_addr, REG_PWR_CTRL, BMP390_PWR_SLEEP);
+    ok &= i2c_write_reg_u8(SENSOR_I2C_PORT, g_addr, REG_OSR, BMP390_OSR_PRESS_X8_TEMP_X1);
+    ok &= i2c_write_reg_u8(SENSOR_I2C_PORT, g_addr, REG_ODR, BMP390_ODR_25HZ);
+    ok &= i2c_write_reg_u8(SENSOR_I2C_PORT, g_addr, REG_CONFIG, BMP390_IIR_COEFF_3);
     ok &= read_calibration(g_addr);
+    ok &= i2c_write_reg_u8(SENSOR_I2C_PORT, g_addr, REG_PWR_CTRL, BMP390_PWR_PRESS_TEMP_NORMAL);
+    reset_baseline_filter(state);
     state.initialized = ok;
     return ok;
 #endif
@@ -136,16 +193,37 @@ bool update(BaroState &state, uint32_t now_ms) {
     if (!state.initialized && !init(state)) return false;
 
     uint8_t buf[6] = {};
-    if (!i2c_read_regs(I2C_PORT, g_addr, REG_DATA, buf, sizeof(buf))) {
+    if (!i2c_read_regs(SENSOR_I2C_PORT, g_addr, REG_DATA, buf, sizeof(buf))) {
         state.valid = (now_ms - state.last_read_ms) < SENSOR_STALE_MS;
         return false;
     }
 
     const uint32_t raw_press = uint32_t(buf[0]) | (uint32_t(buf[1]) << 8) | (uint32_t(buf[2]) << 16);
     const uint32_t raw_temp = uint32_t(buf[3]) | (uint32_t(buf[4]) << 8) | (uint32_t(buf[5]) << 16);
+    state.raw_pressure = raw_press;
+    state.raw_temperature = raw_temp;
+#if BMP390_DEBUG_REGS
+    (void)i2c_read_regs(SENSOR_I2C_PORT, g_addr, REG_ERR, &state.err_reg, 1);
+    (void)i2c_read_regs(SENSOR_I2C_PORT, g_addr, REG_STATUS, &state.status_reg, 1);
+#endif
     double t_lin = 0.0;
     state.temperature_c = float(compensate_temperature(raw_temp, g_calib, t_lin));
     state.pressure_pa = float(compensate_pressure(raw_press, g_calib, t_lin));
+    state.valid = state.pressure_pa > 10000.0f;
+    if (!state.valid) {
+        return false;
+    }
+
+    if (!g_filter_seeded && !baseline_seed_ready(state.pressure_pa)) {
+        state.relative_altitude_m = 0.0f;
+        state.vertical_speed_ms = 0.0f;
+        state.last_read_ms = now_ms;
+        return false;
+    }
+    if (!g_filter_seeded) {
+        g_reference_pressure_pa = state.pressure_pa;
+    }
+
     const float altitude = pressure_to_altitude(state.pressure_pa, g_reference_pressure_pa);
 
     float dt = 1.0f / float(BMP390_SAMPLE_HZ);
@@ -168,8 +246,7 @@ bool update(BaroState &state, uint32_t now_ms) {
     g_prev_filtered_m = state.altitude_m;
     state.relative_altitude_m = state.altitude_m - g_zero_altitude_m;
     state.last_read_ms = now_ms;
-    state.valid = state.pressure_pa > 10000.0f;
-    return state.valid;
+    return true;
 #endif
 }
 
@@ -177,6 +254,7 @@ void set_zero_reference(BaroState &state) {
     if (state.pressure_pa > 10000.0f) {
         g_reference_pressure_pa = state.pressure_pa;
     }
+    state.altitude_m = pressure_to_altitude(state.pressure_pa, g_reference_pressure_pa);
     g_zero_altitude_m = state.altitude_m;
     state.relative_altitude_m = 0.0f;
     state.vertical_speed_ms = 0.0f;

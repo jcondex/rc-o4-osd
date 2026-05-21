@@ -11,6 +11,10 @@ namespace {
 constexpr uint8_t REG_DATA = 0x00;
 constexpr uint8_t REG_CONTROL = 0x09;
 constexpr uint8_t REG_SET_RESET = 0x0B;
+constexpr uint8_t QMC5883L_SET_RESET_PERIOD = 0x01;
+constexpr uint8_t QMC5883L_OSR512_8G_200HZ_CONTINUOUS = 0x1D;
+constexpr float RAD_PER_DEG = 0.0174532925f;
+constexpr float DEG_PER_RAD = 57.29578f;
 
 struct CalState {
     int16_t x_min = 32767;
@@ -28,6 +32,35 @@ CalState g_cal;
 static int16_t le16(const uint8_t *p) {
     return int16_t(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
 }
+
+static float wrap_degrees(float degrees) {
+    while (degrees >= 360.0f) degrees -= 360.0f;
+    while (degrees < 0.0f) degrees += 360.0f;
+    return degrees;
+}
+
+static bool valid_raw_sample(int16_t raw_x, int16_t raw_y, int16_t raw_z) {
+    return !(raw_x == 0 && raw_y == 0 && raw_z == 0);
+}
+}
+
+float heading_from_sample(int16_t raw_x, int16_t raw_y, int16_t raw_z, const CompassCalibration &cal, const ImuState &imu) {
+    const float x = (float(raw_x) - cal.x_offset) * cal.x_scale;
+    const float y = (float(raw_y) - cal.y_offset) * cal.y_scale;
+    const float z = (float(raw_z) - cal.z_offset) * cal.z_scale;
+
+    float heading = 0.0f;
+    if (imu.valid) {
+        const float pitch = imu.pitch_deg * RAD_PER_DEG;
+        const float roll = imu.roll_deg * RAD_PER_DEG;
+        const float xh = x * cosf(pitch) + y * sinf(roll) * sinf(pitch) - z * cosf(roll) * sinf(pitch);
+        const float yh = y * cosf(roll) + z * sinf(roll);
+        heading = atan2f(-yh, xh) * DEG_PER_RAD;
+    } else {
+        heading = atan2f(-y, x) * DEG_PER_RAD;
+    }
+
+    return wrap_degrees(heading + cal.declination_deg);
 }
 
 bool init(CompassState &state) {
@@ -38,8 +71,8 @@ bool init(CompassState &state) {
     state.initialized = false;
     state.valid = false;
     bool ok = true;
-    ok &= i2c_write_reg_u8(I2C_PORT, QMC5883L_ADDR, REG_SET_RESET, 0x01);
-    ok &= i2c_write_reg_u8(I2C_PORT, QMC5883L_ADDR, REG_CONTROL, 0x0D);
+    ok &= i2c_write_reg_u8(COMPASS_I2C_PORT, QMC5883L_ADDR, REG_SET_RESET, QMC5883L_SET_RESET_PERIOD);
+    ok &= i2c_write_reg_u8(COMPASS_I2C_PORT, QMC5883L_ADDR, REG_CONTROL, QMC5883L_OSR512_8G_200HZ_CONTINUOUS);
     state.initialized = ok;
     return ok;
 #endif
@@ -56,7 +89,7 @@ bool update(CompassState &state, const CompassCalibration &cal, const ImuState &
     if (!state.initialized && !init(state)) return false;
 
     uint8_t buf[6] = {};
-    if (!i2c_read_regs(I2C_PORT, QMC5883L_ADDR, REG_DATA, buf, sizeof(buf))) {
+    if (!i2c_read_regs(COMPASS_I2C_PORT, QMC5883L_ADDR, REG_DATA, buf, sizeof(buf))) {
         state.valid = (now_ms - state.last_read_ms) < SENSOR_STALE_MS;
         return false;
     }
@@ -64,30 +97,9 @@ bool update(CompassState &state, const CompassCalibration &cal, const ImuState &
     state.raw_x = le16(&buf[0]);
     state.raw_y = le16(&buf[2]);
     state.raw_z = le16(&buf[4]);
-
-    const float x = (float(state.raw_x) - cal.x_offset) * cal.x_scale;
-    const float y = (float(state.raw_y) - cal.y_offset) * cal.y_scale;
-    const float z = (float(state.raw_z) - cal.z_offset) * cal.z_scale;
-
-    float heading = 0.0f;
-    if (imu.valid) {
-        const float pitch = imu.pitch_deg * 0.0174532925f;
-        const float roll = imu.roll_deg * 0.0174532925f;
-        const float xh = x * cosf(pitch) + y * sinf(roll) * sinf(pitch) - z * cosf(roll) * sinf(pitch);
-        const float yh = y * cosf(roll) + z * sinf(roll);
-        heading = atan2f(-yh, xh) * 57.29578f;
-    } else {
-        heading = atan2f(-y, x) * 57.29578f;
-    }
-
-    if (heading < 0.0f) heading += 360.0f;
-    heading += cal.declination_deg;
-    while (heading >= 360.0f) heading -= 360.0f;
-    while (heading < 0.0f) heading += 360.0f;
-
-    state.heading_deg = heading;
+    state.heading_deg = heading_from_sample(state.raw_x, state.raw_y, state.raw_z, cal, imu);
     state.last_read_ms = now_ms;
-    state.valid = !(state.raw_x == 0 && state.raw_y == 0 && state.raw_z == 0);
+    state.valid = valid_raw_sample(state.raw_x, state.raw_y, state.raw_z);
     return state.valid;
 #endif
 }

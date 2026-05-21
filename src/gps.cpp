@@ -1,24 +1,26 @@
 #include "gps.h"
 
 #include <math.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "config.h"
 
-#ifndef RC_O4_OSD_HOST_TEST
-#include "hardware/gpio.h"
-#include "hardware/uart.h"
-#include "hardware/watchdog.h"
-#include "pico/stdlib.h"
-#endif
-
 namespace gps {
 namespace {
 
-static bool starts_with(const char *s, const char *prefix) {
-    return strncmp(s, prefix, strlen(prefix)) == 0;
+static bool sentence_has_type(const char *type, const char *suffix) {
+    return strlen(type) >= 5 && strcmp(type + 2, suffix) == 0;
+}
+
+static void copy_sentence_type(const char *line, char out[6]) {
+    out[0] = '\0';
+    if (line[0] != '$') return;
+    size_t n = 0;
+    for (const char *p = line + 1; *p && *p != ',' && *p != '*' && n < 5; ++p) {
+        out[n++] = *p;
+    }
+    out[n] = '\0';
 }
 
 static int split_fields(char *line, char **fields, int max_fields) {
@@ -52,16 +54,48 @@ static double parse_coord(const char *value, const char *hemisphere) {
 static bool checksum_ok(const char *line) {
     if (line[0] != '$') return false;
     const char *star = strchr(line, '*');
-    if (!star || strlen(star) < 3) return true;
+    if (!star || strlen(star) < 3) return false;
     uint8_t checksum = 0;
     for (const char *p = line + 1; p < star; ++p) checksum ^= uint8_t(*p);
     const uint8_t expected = uint8_t(strtoul(star + 1, nullptr, 16));
     return checksum == expected;
 }
 
+static int32_t le_i32(const uint8_t *p) {
+    return int32_t(uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24));
+}
+
+static uint16_t le_u16(const uint8_t *p) {
+    return uint16_t(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+}
+
+static float wrap_degrees(float degrees) {
+    while (degrees >= 360.0f) degrees -= 360.0f;
+    while (degrees < 0.0f) degrees += 360.0f;
+    return degrees;
+}
+
+static void mark_receiving(GpsState &state, uint32_t now_ms) {
+    state.receiving = true;
+    state.last_message_ms = now_ms;
+}
+
+static void clear_fix(GpsState &state, bool preserve_satellites = false) {
+    state.fix_valid = false;
+    state.fix_type = 0;
+    if (!preserve_satellites) {
+        state.satellites = 0;
+    }
+    state.altitude_m = 0.0f;
+    state.speed_kmh = 0.0f;
+    state.course_deg = 0.0f;
+    state.updated = false;
+}
+
 static bool parse_rmc(char *line, GpsState &state, uint32_t now_ms) {
     char *f[16] = {};
     split_fields(line, f, 16);
+    mark_receiving(state, now_ms);
     char *status = f[2];
     char *lat = f[3];
     char *ns = f[4];
@@ -72,20 +106,24 @@ static bool parse_rmc(char *line, GpsState &state, uint32_t now_ms) {
 
     state.fix_valid = status && *status == 'A';
     state.fix_type = state.fix_valid ? 1 : 0;
-    if (state.fix_valid) {
-        state.lat_deg = parse_coord(lat, ns);
-        state.lon_deg = parse_coord(lon, ew);
-        state.speed_kmh = speed_kn ? float(strtod(speed_kn, nullptr) * 1.852) : 0.0f;
-        state.course_deg = course ? float(strtod(course, nullptr)) : 0.0f;
-        state.last_fix_ms = now_ms;
-        state.updated = true;
+    if (!state.fix_valid) {
+        clear_fix(state, true);
+        return true;
     }
+
+    state.lat_deg = parse_coord(lat, ns);
+    state.lon_deg = parse_coord(lon, ew);
+    state.speed_kmh = speed_kn ? float(strtod(speed_kn, nullptr) * 1.852) : 0.0f;
+    state.course_deg = course ? wrap_degrees(float(strtod(course, nullptr))) : 0.0f;
+    state.last_fix_ms = now_ms;
+    state.updated = true;
     return true;
 }
 
 static bool parse_gga(char *line, GpsState &state, uint32_t now_ms) {
     char *f[16] = {};
     split_fields(line, f, 16);
+    mark_receiving(state, now_ms);
     char *lat = f[2];
     char *ns = f[3];
     char *lon = f[4];
@@ -100,22 +138,26 @@ static bool parse_gga(char *line, GpsState &state, uint32_t now_ms) {
     state.fix_type = q > 1 ? 2 : (q > 0 ? 1 : 0);
     state.satellites = sats ? uint8_t(atoi(sats)) : 0;
     state.hdop = hdop ? float(strtod(hdop, nullptr)) : 99.9f;
-    if (state.fix_valid) {
-        state.lat_deg = parse_coord(lat, ns);
-        state.lon_deg = parse_coord(lon, ew);
-        state.altitude_m = alt ? float(strtod(alt, nullptr)) : 0.0f;
-        state.last_fix_ms = now_ms;
-        state.updated = true;
+    if (!state.fix_valid) {
+        clear_fix(state, true);
+        return true;
     }
+
+    state.lat_deg = parse_coord(lat, ns);
+    state.lon_deg = parse_coord(lon, ew);
+    state.altitude_m = alt ? float(strtod(alt, nullptr)) : 0.0f;
+    state.last_fix_ms = now_ms;
+    state.updated = true;
     return true;
 }
 
-static bool parse_vtg(char *line, GpsState &state) {
+static bool parse_vtg(char *line, GpsState &state, uint32_t now_ms) {
     char *f[12] = {};
     split_fields(line, f, 12);
+    mark_receiving(state, now_ms);
     char *course = f[1];
     char *kmh = f[7];
-    if (course && *course) state.course_deg = float(strtod(course, nullptr));
+    if (course && *course) state.course_deg = wrap_degrees(float(strtod(course, nullptr)));
     if (kmh && *kmh) state.speed_kmh = float(strtod(kmh, nullptr));
     return true;
 }
@@ -123,10 +165,40 @@ static bool parse_vtg(char *line, GpsState &state) {
 static bool parse_line(char *line, GpsState &state, uint32_t now_ms) {
     state.updated = false;
     if (!checksum_ok(line)) return false;
-    if (starts_with(line, "$GPRMC") || starts_with(line, "$GNRMC")) return parse_rmc(line, state, now_ms);
-    if (starts_with(line, "$GPGGA") || starts_with(line, "$GNGGA")) return parse_gga(line, state, now_ms);
-    if (starts_with(line, "$GPVTG") || starts_with(line, "$GNVTG")) return parse_vtg(line, state);
+    char sentence_type[6] = {};
+    copy_sentence_type(line, sentence_type);
+    if (sentence_has_type(sentence_type, "RMC")) return parse_rmc(line, state, now_ms);
+    if (sentence_has_type(sentence_type, "GGA")) return parse_gga(line, state, now_ms);
+    if (sentence_has_type(sentence_type, "VTG")) return parse_vtg(line, state, now_ms);
     return false;
+}
+
+static bool parse_ubx_nav_pvt(const uint8_t *payload, uint16_t len, GpsState &state, uint32_t now_ms) {
+    if (len < 78) return false;
+
+    const uint8_t fix_type = payload[20];
+    const uint8_t flags = payload[21];
+    const bool fix_ok = (flags & 0x01u) != 0 && fix_type >= 2;
+
+    state.satellites = payload[23];
+    state.hdop = float(le_u16(&payload[76])) / 100.0f;
+    mark_receiving(state, now_ms);
+
+    if (!fix_ok) {
+        clear_fix(state, true);
+        return true;
+    }
+
+    state.fix_valid = true;
+    state.fix_type = fix_type;
+    state.lon_deg = double(le_i32(&payload[24])) * 1.0e-7;
+    state.lat_deg = double(le_i32(&payload[28])) * 1.0e-7;
+    state.altitude_m = float(le_i32(&payload[36])) / 1000.0f;
+    state.speed_kmh = float(le_i32(&payload[60])) * 0.0036f;
+    state.course_deg = wrap_degrees(float(le_i32(&payload[64])) / 100000.0f);
+    state.last_fix_ms = now_ms;
+    state.updated = true;
+    return true;
 }
 
 }
@@ -143,170 +215,164 @@ void ubx_checksum(const uint8_t *data, size_t len, uint8_t &ck_a, uint8_t &ck_b)
 void NmeaParser::reset() {
     len_ = 0;
     line_[0] = '\0';
+    ubx_state_ = UbxParseState::Sync1;
+    ubx_class_ = 0;
+    ubx_id_ = 0;
+    ubx_len_ = 0;
+    ubx_pos_ = 0;
+    ubx_ck_a_ = 0;
+    ubx_ck_b_ = 0;
 }
 
 bool NmeaParser::parse_byte(uint8_t byte, GpsState &state, uint32_t now_ms) {
+    ++stats_.bytes;
+    switch (ubx_state_) {
+    case UbxParseState::Sync1:
+        if (byte == 0xB5) {
+            len_ = 0;
+            line_[0] = '\0';
+            ubx_state_ = UbxParseState::Sync2;
+            return false;
+        }
+        break;
+    case UbxParseState::Sync2:
+        if (byte == 0x62) {
+            ubx_state_ = UbxParseState::Class;
+            ubx_ck_a_ = 0;
+            ubx_ck_b_ = 0;
+            return false;
+        }
+        ubx_state_ = UbxParseState::Sync1;
+        if (byte == 0xB5) {
+            ubx_state_ = UbxParseState::Sync2;
+            return false;
+        }
+        break;
+    case UbxParseState::Class:
+        ubx_class_ = byte;
+        ubx_ck_a_ = uint8_t(ubx_ck_a_ + byte);
+        ubx_ck_b_ = uint8_t(ubx_ck_b_ + ubx_ck_a_);
+        ubx_state_ = UbxParseState::Id;
+        return false;
+    case UbxParseState::Id:
+        ubx_id_ = byte;
+        ubx_ck_a_ = uint8_t(ubx_ck_a_ + byte);
+        ubx_ck_b_ = uint8_t(ubx_ck_b_ + ubx_ck_a_);
+        ubx_state_ = UbxParseState::Len1;
+        return false;
+    case UbxParseState::Len1:
+        ubx_len_ = byte;
+        ubx_ck_a_ = uint8_t(ubx_ck_a_ + byte);
+        ubx_ck_b_ = uint8_t(ubx_ck_b_ + ubx_ck_a_);
+        ubx_state_ = UbxParseState::Len2;
+        return false;
+    case UbxParseState::Len2:
+        ubx_len_ |= uint16_t(byte) << 8;
+        ubx_ck_a_ = uint8_t(ubx_ck_a_ + byte);
+        ubx_ck_b_ = uint8_t(ubx_ck_b_ + ubx_ck_a_);
+        ubx_pos_ = 0;
+        if (ubx_len_ > sizeof(ubx_payload_)) {
+            ++stats_.ubx_oversize;
+            ubx_pos_ = uint16_t(ubx_len_ + 2u);
+            ubx_state_ = UbxParseState::DiscardOversize;
+            return false;
+        }
+        ubx_state_ = ubx_len_ == 0 ? UbxParseState::ChecksumA : UbxParseState::Payload;
+        return false;
+    case UbxParseState::Payload:
+        ubx_payload_[ubx_pos_++] = byte;
+        ubx_ck_a_ = uint8_t(ubx_ck_a_ + byte);
+        ubx_ck_b_ = uint8_t(ubx_ck_b_ + ubx_ck_a_);
+        if (ubx_pos_ >= ubx_len_) {
+            ubx_state_ = UbxParseState::ChecksumA;
+        }
+        return false;
+    case UbxParseState::ChecksumA:
+        if (byte != ubx_ck_a_) {
+            ++stats_.ubx_checksum_errors;
+            ubx_state_ = UbxParseState::Sync1;
+            return false;
+        }
+        ubx_state_ = UbxParseState::ChecksumB;
+        return false;
+    case UbxParseState::ChecksumB: {
+        ubx_state_ = UbxParseState::Sync1;
+        if (byte != ubx_ck_b_) {
+            ++stats_.ubx_checksum_errors;
+            return false;
+        }
+        ++stats_.ubx_frames;
+        if (ubx_class_ == 0x01 && ubx_id_ == 0x07 && parse_ubx_nav_pvt(ubx_payload_, ubx_len_, state, now_ms)) {
+            ++stats_.ubx_nav_pvt;
+            return true;
+        }
+        return false;
+    }
+    case UbxParseState::DiscardOversize:
+        if (ubx_pos_ > 0) {
+            --ubx_pos_;
+        }
+        if (ubx_pos_ == 0) {
+            ubx_state_ = UbxParseState::Sync1;
+        }
+        return false;
+    }
+
     if (byte == '$') {
+        ++stats_.dollar_signs;
         len_ = 0;
     }
     if (byte == '\r') return false;
     if (byte == '\n') {
+        ++stats_.newlines;
         line_[len_] = '\0';
-        bool ok = len_ > 0 ? parse_line(line_, state, now_ms) : false;
+        bool ok = false;
+        if (len_ > 0) {
+            state.updated = false;
+            ++stats_.sentences;
+            char sentence_type[6] = {};
+            copy_sentence_type(line_, sentence_type);
+            const bool has_bad_checksum = line_[0] == '$' && !checksum_ok(line_);
+            if (has_bad_checksum) {
+                ++stats_.checksum_errors;
+                memcpy(stats_.last_bad_type, sentence_type, sizeof(stats_.last_bad_type));
+            } else {
+                ok = parse_line(line_, state, now_ms);
+                if (ok) {
+                    ++stats_.parsed_sentences;
+                    memcpy(stats_.last_good_type, sentence_type, sizeof(stats_.last_good_type));
+                    if (sentence_has_type(sentence_type, "RMC")) {
+                        ++stats_.rmc_sentences;
+                    } else if (sentence_has_type(sentence_type, "GGA")) {
+                        ++stats_.gga_sentences;
+                    } else if (sentence_has_type(sentence_type, "VTG")) {
+                        ++stats_.vtg_sentences;
+                    }
+                } else if (sentence_type[0]) {
+                    ++stats_.unsupported_sentences;
+                }
+            }
+        }
         len_ = 0;
         return ok;
     }
     if (len_ < sizeof(line_) - 1) {
         line_[len_++] = char(byte);
     } else {
+        ++stats_.overflows;
         reset();
     }
     return false;
 }
 
 void update_timeout(GpsState &state, uint32_t now_ms) {
+    if (state.receiving && (state.last_message_ms == 0 || (now_ms - state.last_message_ms) > GPS_LINK_TIMEOUT_MS)) {
+        state.receiving = false;
+    }
     if (!state.fix_valid) return;
     if (state.last_fix_ms == 0 || (now_ms - state.last_fix_ms) > GPS_FIX_TIMEOUT_MS) {
-        state.fix_valid = false;
-        state.fix_type = 0;
-        state.satellites = 0;
-        state.speed_kmh = 0.0f;
-        state.updated = false;
+        clear_fix(state);
     }
 }
-
-#ifndef RC_O4_OSD_HOST_TEST
-namespace {
-
-static void write_ubx_frame(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, size_t len) {
-    uint8_t header[6] = {0xB5, 0x62, msg_class, msg_id, uint8_t(len), uint8_t(len >> 8)};
-    uint8_t ck_a = 0;
-    uint8_t ck_b = 0;
-    ubx_checksum(&header[2], 4, ck_a, ck_b);
-    for (size_t i = 0; i < len; ++i) {
-        ck_a = uint8_t(ck_a + payload[i]);
-        ck_b = uint8_t(ck_b + ck_a);
-    }
-    uart_write_blocking(uart1, header, sizeof(header));
-    if (len > 0) uart_write_blocking(uart1, payload, len);
-    const uint8_t checksum[2] = {ck_a, ck_b};
-    uart_write_blocking(uart1, checksum, sizeof(checksum));
-}
-
-static bool ubx_wait_ack(uint8_t expect_class, uint8_t expect_id, uint32_t timeout_ms) {
-    enum class AckState : uint8_t { Sync1, Sync2, Class, Id, Len1, Len2, PayloadClass, PayloadId, Cka, Ckb };
-    AckState st = AckState::Sync1;
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-
-    while ((to_ms_since_boot(get_absolute_time()) - start) < timeout_ms) {
-        if (!uart_is_readable(uart1)) {
-            watchdog_update();
-            tight_loop_contents();
-            continue;
-        }
-        const uint8_t b = uart_getc(uart1);
-        switch (st) {
-        case AckState::Sync1: st = (b == 0xB5) ? AckState::Sync2 : AckState::Sync1; break;
-        case AckState::Sync2: st = (b == 0x62) ? AckState::Class : AckState::Sync1; break;
-        case AckState::Class: st = (b == 0x05) ? AckState::Id : AckState::Sync1; break;
-        case AckState::Id:
-            if (b == 0x00) return false;
-            st = (b == 0x01) ? AckState::Len1 : AckState::Sync1;
-            break;
-        case AckState::Len1: st = (b == 0x02) ? AckState::Len2 : AckState::Sync1; break;
-        case AckState::Len2: st = (b == 0x00) ? AckState::PayloadClass : AckState::Sync1; break;
-        case AckState::PayloadClass: st = (b == expect_class) ? AckState::PayloadId : AckState::Sync1; break;
-        case AckState::PayloadId: st = (b == expect_id) ? AckState::Cka : AckState::Sync1; break;
-        case AckState::Cka: st = AckState::Ckb; break;
-        case AckState::Ckb: return true;
-        }
-    }
-    return false;
-}
-
-static bool ubx_send_and_ack(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, size_t len) {
-    write_ubx_frame(msg_class, msg_id, payload, len);
-    if (ubx_wait_ack(msg_class, msg_id, 500)) return true;
-    write_ubx_frame(msg_class, msg_id, payload, len);
-    return ubx_wait_ack(msg_class, msg_id, 500);
-}
-
-static void reinit_gps_uart(uint32_t baud) {
-    uart_deinit(uart1);
-    uart_init(uart1, baud);
-    gpio_set_function(PIN_UART1_TX, GPIO_FUNC_UART);
-    gpio_set_function(PIN_UART1_RX, GPIO_FUNC_UART);
-    uart_set_hw_flow(uart1, false, false);
-    uart_set_format(uart1, 8, 1, UART_PARITY_NONE);
-    uart_set_fifo_enabled(uart1, true);
-}
-
-static bool wait_for_nmea(uint32_t timeout_ms) {
-    const uint32_t start = to_ms_since_boot(get_absolute_time());
-    while ((to_ms_since_boot(get_absolute_time()) - start) < timeout_ms) {
-        if (uart_is_readable(uart1)) {
-            const uint8_t b = uart_getc(uart1);
-            if (b == '$') return true;
-        }
-        watchdog_update();
-        tight_loop_contents();
-    }
-    return false;
-}
-
-}
-
-void init_uart() {
-    reinit_gps_uart(UART_GPS_BAUD_INIT);
-}
-
-void poll_uart(NmeaParser &parser, GpsState &state, uint32_t now_ms) {
-    while (uart_is_readable(uart1)) {
-        parser.parse_byte(uart_getc(uart1), state, now_ms);
-    }
-}
-
-void send_ubx_startup_config() {
-    const uint32_t wait_start = to_ms_since_boot(get_absolute_time());
-    while ((to_ms_since_boot(get_absolute_time()) - wait_start) < 1000u) {
-        watchdog_update();
-        sleep_ms(10);
-    }
-
-    const uint8_t disable_gll[] = {0xF0, 0x01, 0, 0, 0, 0, 0, 0};
-    const uint8_t disable_gsv[] = {0xF0, 0x03, 0, 0, 0, 0, 0, 0};
-    const uint8_t disable_gsa[] = {0xF0, 0x02, 0, 0, 0, 0, 0, 0};
-    const uint8_t set_5hz[] = {0xC8, 0x00, 0x01, 0x00, 0x01, 0x00};
-    const uint8_t set_baud_115200[] = {
-        0x01, 0x00, 0x00, 0x00,
-        0xD0, 0x08, 0x00, 0x00,
-        0x00, 0xC2, 0x01, 0x00,
-        0x07, 0x00,
-        0x03, 0x00,
-        0x00, 0x00,
-        0x00, 0x00,
-    };
-
-    (void)ubx_send_and_ack(0x06, 0x01, disable_gll, sizeof(disable_gll));
-    (void)ubx_send_and_ack(0x06, 0x01, disable_gsv, sizeof(disable_gsv));
-    (void)ubx_send_and_ack(0x06, 0x01, disable_gsa, sizeof(disable_gsa));
-    (void)ubx_send_and_ack(0x06, 0x08, set_5hz, sizeof(set_5hz));
-
-    write_ubx_frame(0x06, 0x00, set_baud_115200, sizeof(set_baud_115200));
-    const uint32_t baud_wait_start = to_ms_since_boot(get_absolute_time());
-    while ((to_ms_since_boot(get_absolute_time()) - baud_wait_start) < 100u) {
-        watchdog_update();
-        sleep_ms(5);
-    }
-    reinit_gps_uart(UART_GPS_BAUD_FAST);
-    if (!wait_for_nmea(500)) {
-        reinit_gps_uart(UART_GPS_BAUD_INIT);
-    }
-}
-#else
-void init_uart() {}
-void poll_uart(NmeaParser &, GpsState &, uint32_t) {}
-void send_ubx_startup_config() {}
-#endif
 
 }

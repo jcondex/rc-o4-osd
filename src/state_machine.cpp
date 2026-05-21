@@ -1,6 +1,13 @@
 #include "state_machine.h"
 
 namespace state_machine {
+namespace {
+
+bool arm_position_selected(const RcState &rc) {
+    return rc.arm_switch_middle || rc.arm_switch_high;
+}
+
+}
 
 TransitionResult update(TelemetryState &state) {
     TransitionResult result;
@@ -18,15 +25,26 @@ TransitionResult update(TelemetryState &state) {
         break;
     case AppState::Failsafe:
         state.armed = false;
-        if (state.rc.signal_valid && state.rc.arm_switch_low) {
-            state.rc.rearm_latched = true;
-            state.app_state = AppState::Disarmed;
+        if (state.rc.signal_valid) {
+            if (state.rc.arm_switch_low) {
+                state.rc.rearm_latched = true;
+                state.app_state = AppState::Disarmed;
+            } else if (arm_position_selected(state.rc) && state.rc.has_armed_once) {
+                state.armed = true;
+                state.app_state = AppState::Armed;
+            } else {
+                state.app_state = AppState::Disarmed;
+            }
         }
         break;
     case AppState::Disarmed:
         state.armed = false;
-        if (state.rc.signal_valid && state.rc.arm_switch_high && state.rc.rearm_latched) {
+        if (state.rc.signal_valid && state.rc.arm_switch_low) {
+            state.rc.rearm_latched = true;
+        }
+        if (state.rc.signal_valid && arm_position_selected(state.rc) && state.rc.rearm_latched) {
             state.armed = true;
+            state.rc.has_armed_once = true;
             state.rc.rearm_latched = false;
             state.app_state = AppState::Armed;
         }
@@ -34,6 +52,7 @@ TransitionResult update(TelemetryState &state) {
     case AppState::Armed:
         state.armed = true;
         if (state.rc.signal_valid && state.rc.arm_switch_low) {
+            state.rc.rearm_latched = true;
             state.armed = false;
             state.app_state = AppState::Disarmed;
         }
